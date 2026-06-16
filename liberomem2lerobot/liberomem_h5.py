@@ -15,24 +15,58 @@ from generic_converter import BaseAdapter, ConversionTask, run_converter  # noqa
 
 
 class LiberoAdapter(BaseAdapter):
-    dataset_type = "libero"
+    dataset_type = "libero-mem"
     fps = 20
     robot_type = "franka"
     features = {
-        "observation.images.image": {
+        # ── RGB images ──────────────────────────────────────────────────────────
+        "observation.images.agentview_rgb": {
             "dtype": "video",
             "shape": (256, 256, 3),
             "names": ["height", "width", "rgb"],
         },
-        "observation.images.wrist_image": {
+        "observation.images.eye_in_hand_rgb": {
             "dtype": "video",
             "shape": (256, 256, 3),
             "names": ["height", "width", "rgb"],
         },
+        # ── Depth maps (single-channel uint8) ───────────────────────────────────
+        "observation.images.agentview_depth": {
+            "dtype": "video",
+            "shape": (256, 256, 1),
+            "names": ["height", "width", "depth"],
+        },
+        "observation.images.eye_in_hand_depth": {
+            "dtype": "video",
+            "shape": (256, 256, 1),
+            "names": ["height", "width", "depth"],
+        },
+        # ── Segmentation maps (single-channel uint8 class indices) ───────────────
+        "observation.images.agentview_seg": {
+            "dtype": "video",
+            "shape": (256, 256, 1),
+            "names": ["height", "width", "seg"],
+        },
+        "observation.images.eye_in_hand_seg": {
+            "dtype": "video",
+            "shape": (256, 256, 1),
+            "names": ["height", "width", "seg"],
+        },
+        # ── Proprioception ───────────────────────────────────────────────────────
         "observation.state": {
             "dtype": "float32",
             "shape": (8,),
             "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3", "gripper", "gripper"]},
+        },
+        "observation.states.ee_pos": {
+            "dtype": "float32",
+            "shape": (3,),
+            "names": {"motors": ["x", "y", "z"]},
+        },
+        "observation.states.ee_ori": {
+            "dtype": "float32",
+            "shape": (3,),
+            "names": {"motors": ["axis_angle1", "axis_angle2", "axis_angle3"]},
         },
         "observation.states.ee_state": {
             "dtype": "float32",
@@ -49,10 +83,27 @@ class LiberoAdapter(BaseAdapter):
             "shape": (2,),
             "names": {"motors": ["gripper", "gripper"]},
         },
+        "observation.states.robot_state": {
+            "dtype": "float32",
+            "shape": (9,),
+            "names": {"motors": ["motor_0", "motor_1", "motor_2", "motor_3", "motor_4", "motor_5", "motor_6", "motor_7", "motor_8"]},
+        },
+        # ── Action ───────────────────────────────────────────────────────────────
         "action": {
             "dtype": "float32",
             "shape": (7,),
             "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3", "gripper"]},
+        },
+        # ── RL annotations ───────────────────────────────────────────────────────
+        "next.reward": {
+            "dtype": "float32",
+            "shape": (1,),
+            "names": ["reward"],
+        },
+        "next.done": {
+            "dtype": "bool",
+            "shape": (1,),
+            "names": ["done"],
         },
     }
     tags = ["libero", "franka"]
@@ -96,6 +147,7 @@ class LiberoAdapter(BaseAdapter):
         with File(input_h5, "r") as f:
             for demo in f["data"].values():
                 demo_len = len(demo["obs/agentview_rgb"])
+
                 # (-1: open, 1: close) -> (0: close, 1: open)
                 action = np.array(demo["actions"])
                 action = np.concatenate(
@@ -105,6 +157,8 @@ class LiberoAdapter(BaseAdapter):
                     ],
                     axis=1,
                 )
+
+                # primary policy state: ee pose + gripper
                 state = np.concatenate(
                     [
                         np.array(demo["obs/ee_states"]),
@@ -112,14 +166,34 @@ class LiberoAdapter(BaseAdapter):
                     ],
                     axis=1,
                 )
+
+                # (T, H, W) → (T, H, W, 1) for single-channel video features
+                def expand(key):
+                    return np.array(demo[key])[..., None]
+
                 episode = {
-                    "observation.images.image": np.array(demo["obs/agentview_rgb"]),
-                    "observation.images.wrist_image": np.array(demo["obs/eye_in_hand_rgb"]),
+                    # RGB
+                    "observation.images.agentview_rgb": np.array(demo["obs/agentview_rgb"]),
+                    "observation.images.eye_in_hand_rgb": np.array(demo["obs/eye_in_hand_rgb"]),
+                    # Depth
+                    "observation.images.agentview_depth": expand("obs/agentview_depth"),
+                    "observation.images.eye_in_hand_depth": expand("obs/eye_in_hand_depth"),
+                    # Segmentation
+                    "observation.images.agentview_seg": expand("obs/agentview_seg"),
+                    "observation.images.eye_in_hand_seg": expand("obs/eye_in_hand_seg"),
+                    # Proprioception
                     "observation.state": np.array(state, dtype=np.float32),
+                    "observation.states.ee_pos": np.array(demo["obs/ee_pos"], dtype=np.float32),
+                    "observation.states.ee_ori": np.array(demo["obs/ee_ori"], dtype=np.float32),
                     "observation.states.ee_state": np.array(demo["obs/ee_states"], dtype=np.float32),
                     "observation.states.joint_state": np.array(demo["obs/joint_states"], dtype=np.float32),
                     "observation.states.gripper_state": np.array(demo["obs/gripper_states"], dtype=np.float32),
+                    "observation.states.robot_state": np.array(demo["robot_states"], dtype=np.float32),
+                    # Action
                     "action": np.array(action, dtype=np.float32),
+                    # RL annotations
+                    "next.reward": np.array(demo["rewards"], dtype=np.float32)[:, None],
+                    "next.done": np.array(demo["dones"], dtype=bool)[:, None],
                 }
                 yield [{**{k: v[i] for k, v in episode.items()}, "task": task_instruction} for i in range(demo_len)]
 
