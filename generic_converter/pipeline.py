@@ -48,7 +48,8 @@ class SaveLeRobotDataset(PipelineStep):
         for episode_index, episode_data in enumerate(raw_dataset):
             with self.track_time("saving episode"):
                 for frame in episode_data:
-                    dataset.add_frame(frame)
+                    task_str = frame.pop("task", None)
+                    dataset.add_frame(frame, task_str)
                 dataset.save_episode()
                 logger.info(
                     f"process done for {dataset.repo_id}, episode {episode_index}, len {len(episode_data)}"
