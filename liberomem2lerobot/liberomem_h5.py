@@ -100,7 +100,7 @@ FEATURES = {
     },
 }
 
-_PATTERN1 = re.compile(r"_SCENE\d+_(.*?)_demo\.hdf5")
+_PATTERN1 = re.compile(r"_SCENE\d_\d+_(.*?)_demo\.hdf5")
 _PATTERN2 = re.compile(r"(.*?)_demo\.hdf5")
 
 
