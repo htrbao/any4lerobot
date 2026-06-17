@@ -30,27 +30,27 @@ class LiberoAdapter(BaseAdapter):
             "shape": (256, 256, 3),
             "names": ["height", "width", "rgb"],
         },
-        # ── Depth maps (single-channel uint8) ───────────────────────────────────
+        # ── Depth maps (tiled to 3 channels for video encoder) ──────────────────
         "observation.images.agentview_depth": {
             "dtype": "video",
-            "shape": (256, 256, 1),
-            "names": ["height", "width", "depth"],
+            "shape": (256, 256, 3),
+            "names": ["height", "width", "rgb"],
         },
         "observation.images.eye_in_hand_depth": {
             "dtype": "video",
-            "shape": (256, 256, 1),
-            "names": ["height", "width", "depth"],
+            "shape": (256, 256, 3),
+            "names": ["height", "width", "rgb"],
         },
-        # ── Segmentation maps (single-channel uint8 class indices) ───────────────
+        # ── Segmentation maps (tiled to 3 channels for video encoder) ───────────
         "observation.images.agentview_seg": {
             "dtype": "video",
-            "shape": (256, 256, 1),
-            "names": ["height", "width", "seg"],
+            "shape": (256, 256, 3),
+            "names": ["height", "width", "rgb"],
         },
         "observation.images.eye_in_hand_seg": {
             "dtype": "video",
-            "shape": (256, 256, 1),
-            "names": ["height", "width", "seg"],
+            "shape": (256, 256, 3),
+            "names": ["height", "width", "rgb"],
         },
         # ── Proprioception ───────────────────────────────────────────────────────
         "observation.state": {
@@ -167,9 +167,10 @@ class LiberoAdapter(BaseAdapter):
                     axis=1,
                 )
 
-                # (T, H, W) → (T, H, W, 1) for single-channel video features
+                # (T, H, W) → (T, H, W, 3): tile single-channel to 3 channels
+                # required because LeRobot's video encoder only accepts 3-channel images
                 def expand(key):
-                    return np.array(demo[key])[..., None]
+                    return np.repeat(np.array(demo[key])[..., None], 3, axis=-1)
 
                 episode = {
                     # RGB
