@@ -1,246 +1,226 @@
 import argparse
 import re
-import sys
-from collections.abc import Iterable, Sequence
+import shutil
 from pathlib import Path
 
+import h5py
 import numpy as np
-from h5py import File
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from tqdm import tqdm
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+FEATURES = {
+    # ── RGB images ──────────────────────────────────────────────────────────────
+    "observation.images.agentview_rgb": {
+        "dtype": "video",
+        "shape": (256, 256, 3),
+        "names": ["height", "width", "rgb"],
+    },
+    "observation.images.eye_in_hand_rgb": {
+        "dtype": "video",
+        "shape": (256, 256, 3),
+        "names": ["height", "width", "rgb"],
+    },
+    # ── Depth maps (tiled to 3 ch — LeRobot video encoder requires RGB) ─────────
+    "observation.images.agentview_depth": {
+        "dtype": "video",
+        "shape": (256, 256, 3),
+        "names": ["height", "width", "rgb"],
+    },
+    "observation.images.eye_in_hand_depth": {
+        "dtype": "video",
+        "shape": (256, 256, 3),
+        "names": ["height", "width", "rgb"],
+    },
+    # ── Segmentation maps (tiled to 3 ch) ───────────────────────────────────────
+    "observation.images.agentview_seg": {
+        "dtype": "video",
+        "shape": (256, 256, 3),
+        "names": ["height", "width", "rgb"],
+    },
+    "observation.images.eye_in_hand_seg": {
+        "dtype": "video",
+        "shape": (256, 256, 3),
+        "names": ["height", "width", "rgb"],
+    },
+    # ── Proprioception ───────────────────────────────────────────────────────────
+    "observation.state": {
+        "dtype": "float32",
+        "shape": (8,),
+        "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3", "gripper", "gripper"]},
+    },
+    "observation.states.ee_pos": {
+        "dtype": "float32",
+        "shape": (3,),
+        "names": {"motors": ["x", "y", "z"]},
+    },
+    "observation.states.ee_ori": {
+        "dtype": "float32",
+        "shape": (3,),
+        "names": {"motors": ["axis_angle1", "axis_angle2", "axis_angle3"]},
+    },
+    "observation.states.ee_state": {
+        "dtype": "float32",
+        "shape": (6,),
+        "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3"]},
+    },
+    "observation.states.joint_state": {
+        "dtype": "float32",
+        "shape": (7,),
+        "names": {"motors": ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]},
+    },
+    "observation.states.gripper_state": {
+        "dtype": "float32",
+        "shape": (2,),
+        "names": {"motors": ["gripper", "gripper"]},
+    },
+    "observation.states.robot_state": {
+        "dtype": "float32",
+        "shape": (9,),
+        "names": {"motors": ["motor_0", "motor_1", "motor_2", "motor_3", "motor_4", "motor_5", "motor_6", "motor_7", "motor_8"]},
+    },
+    # ── Action ───────────────────────────────────────────────────────────────────
+    "action": {
+        "dtype": "float32",
+        "shape": (7,),
+        "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3", "gripper"]},
+    },
+    # ── RL annotations ───────────────────────────────────────────────────────────
+    "next.reward": {
+        "dtype": "float32",
+        "shape": (1,),
+        "names": ["reward"],
+    },
+    "next.done": {
+        "dtype": "bool",
+        "shape": (1,),
+        "names": ["done"],
+    },
+}
 
-from generic_converter import BaseAdapter, ConversionTask, run_converter  # noqa: E402
+_PATTERN1 = re.compile(r"_SCENE\d+_(.*?)_demo\.hdf5")
+_PATTERN2 = re.compile(r"(.*?)_demo\.hdf5")
 
 
-class LiberoAdapter(BaseAdapter):
-    dataset_type = "libero-mem"
-    fps = 20
-    robot_type = "franka"
-    features = {
-        # ── RGB images ──────────────────────────────────────────────────────────
-        "observation.images.agentview_rgb": {
-            "dtype": "video",
-            "shape": (256, 256, 3),
-            "names": ["height", "width", "rgb"],
-        },
-        "observation.images.eye_in_hand_rgb": {
-            "dtype": "video",
-            "shape": (256, 256, 3),
-            "names": ["height", "width", "rgb"],
-        },
-        # ── Depth maps (tiled to 3 channels for video encoder) ──────────────────
-        "observation.images.agentview_depth": {
-            "dtype": "video",
-            "shape": (256, 256, 3),
-            "names": ["height", "width", "rgb"],
-        },
-        "observation.images.eye_in_hand_depth": {
-            "dtype": "video",
-            "shape": (256, 256, 3),
-            "names": ["height", "width", "rgb"],
-        },
-        # ── Segmentation maps (tiled to 3 channels for video encoder) ───────────
-        "observation.images.agentview_seg": {
-            "dtype": "video",
-            "shape": (256, 256, 3),
-            "names": ["height", "width", "rgb"],
-        },
-        "observation.images.eye_in_hand_seg": {
-            "dtype": "video",
-            "shape": (256, 256, 3),
-            "names": ["height", "width", "rgb"],
-        },
-        # ── Proprioception ───────────────────────────────────────────────────────
-        "observation.state": {
-            "dtype": "float32",
-            "shape": (8,),
-            "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3", "gripper", "gripper"]},
-        },
-        "observation.states.ee_pos": {
-            "dtype": "float32",
-            "shape": (3,),
-            "names": {"motors": ["x", "y", "z"]},
-        },
-        "observation.states.ee_ori": {
-            "dtype": "float32",
-            "shape": (3,),
-            "names": {"motors": ["axis_angle1", "axis_angle2", "axis_angle3"]},
-        },
-        "observation.states.ee_state": {
-            "dtype": "float32",
-            "shape": (6,),
-            "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3"]},
-        },
-        "observation.states.joint_state": {
-            "dtype": "float32",
-            "shape": (7,),
-            "names": {"motors": ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]},
-        },
-        "observation.states.gripper_state": {
-            "dtype": "float32",
-            "shape": (2,),
-            "names": {"motors": ["gripper", "gripper"]},
-        },
-        "observation.states.robot_state": {
-            "dtype": "float32",
-            "shape": (9,),
-            "names": {"motors": ["motor_0", "motor_1", "motor_2", "motor_3", "motor_4", "motor_5", "motor_6", "motor_7", "motor_8"]},
-        },
-        # ── Action ───────────────────────────────────────────────────────────────
-        "action": {
-            "dtype": "float32",
-            "shape": (7,),
-            "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3", "gripper"]},
-        },
-        # ── RL annotations ───────────────────────────────────────────────────────
-        "next.reward": {
-            "dtype": "float32",
-            "shape": (1,),
-            "names": ["reward"],
-        },
-        "next.done": {
-            "dtype": "bool",
-            "shape": (1,),
-            "names": ["done"],
-        },
-    }
-    tags = ["libero", "franka"]
+def _task_instruction(filename: str) -> str | None:
+    match = _PATTERN1.search(filename) or _PATTERN2.search(filename)
+    return match.group(1).replace("_", " ") if match else None
 
-    def __init__(self, src_paths: list[Path], output_path: Path):
-        super().__init__(output_path)
-        self.src_paths = src_paths
 
-    def load_tasks(self) -> list[ConversionTask]:
-        tasks = []
-        for src_path in self.src_paths:
-            for input_h5 in src_path.glob("*.hdf5"):
-                pattern1 = re.compile(r"_SCENE\d+_(.*?)_demo\.hdf5")
-                pattern2 = re.compile(r"(.*?)_demo\.hdf5")
+def _iter_h5_files(src_paths: list[Path]):
+    for src in src_paths:
+        if src.is_file() and src.suffix == ".hdf5":
+            yield src
+        elif src.is_dir():
+            yield from sorted(src.glob("*.hdf5"))
 
-                match = pattern1.search(input_h5.name)
-                if match is None:
-                    match = pattern2.search(input_h5.name)
-                if match is None:
-                    continue
-                else:
-                    task_instruction = match.group(1).replace("_", " ")
 
-                tasks.append(
-                    ConversionTask(
-                        input_path=input_h5.resolve(),
-                        output_path=(
-                            self.temp_output_path
-                            / f"{src_path.name}"
-                            / input_h5.stem
-                        ).resolve(),
-                        local_repo_id=f"{input_h5.parent.name}/{input_h5.name}",
-                        metadata={"task": task_instruction},
-                    )
-                )
-        return tasks
-
-    def load_subset(self, task: ConversionTask) -> Iterable[Sequence[dict]]:
-        input_h5 = task.input_path
-        task_instruction = task.metadata.get("task")
-        with File(input_h5, "r") as f:
-            for demo in f["data"].values():
-                demo_len = len(demo["obs/agentview_rgb"])
-
-                # (-1: open, 1: close) -> (0: close, 1: open)
-                action = np.array(demo["actions"])
-                action = np.concatenate(
-                    [
-                        action[:, :6],
-                        (1 - np.clip(action[:, -1], 0, 1))[:, None],
-                    ],
-                    axis=1,
-                )
-
-                # primary policy state: ee pose + gripper
-                state = np.concatenate(
-                    [
-                        np.array(demo["obs/ee_states"]),
-                        np.array(demo["obs/gripper_states"]),
-                    ],
-                    axis=1,
-                )
-
-                # (T, H, W) → (T, H, W, 3): tile single-channel to 3 channels
-                # required because LeRobot's video encoder only accepts 3-channel images
-                def expand(key):
-                    return np.repeat(np.array(demo[key])[..., None], 3, axis=-1)
-
-                episode = {
-                    # RGB
-                    "observation.images.agentview_rgb": np.array(demo["obs/agentview_rgb"]),
-                    "observation.images.eye_in_hand_rgb": np.array(demo["obs/eye_in_hand_rgb"]),
-                    # Depth
-                    "observation.images.agentview_depth": expand("obs/agentview_depth"),
-                    "observation.images.eye_in_hand_depth": expand("obs/eye_in_hand_depth"),
-                    # Segmentation
-                    "observation.images.agentview_seg": expand("obs/agentview_seg"),
-                    "observation.images.eye_in_hand_seg": expand("obs/eye_in_hand_seg"),
-                    # Proprioception
-                    "observation.state": np.array(state, dtype=np.float32),
-                    "observation.states.ee_pos": np.array(demo["obs/ee_pos"], dtype=np.float32),
-                    "observation.states.ee_ori": np.array(demo["obs/ee_ori"], dtype=np.float32),
-                    "observation.states.ee_state": np.array(demo["obs/ee_states"], dtype=np.float32),
-                    "observation.states.joint_state": np.array(demo["obs/joint_states"], dtype=np.float32),
-                    "observation.states.gripper_state": np.array(demo["obs/gripper_states"], dtype=np.float32),
-                    "observation.states.robot_state": np.array(demo["robot_states"], dtype=np.float32),
-                    # Action
-                    "action": np.array(action, dtype=np.float32),
-                    # RL annotations
-                    "next.reward": np.array(demo["rewards"], dtype=np.float32)[:, None],
-                    "next.done": np.array(demo["dones"], dtype=bool)[:, None],
-                }
-                yield [{**{k: v[i] for k, v in episode.items()}, "task": task_instruction} for i in range(demo_len)]
+def _expand(arr: np.ndarray) -> np.ndarray:
+    """(H, W) → (H, W, 3): tile single-channel to RGB for the video encoder."""
+    return np.repeat(arr[..., None], 3, axis=-1)
 
 
 def main(
     src_paths: list[Path],
     output_path: Path,
-    executor: str,
-    cpus_per_task: int,
-    tasks_per_job: int,
-    workers: int,
-    resume_dir: Path | None = None,
-    debug: bool = False,
-    repo_id: str | None = None,
+    repo_id: str,
     push_to_hub: bool = False,
 ):
-    adapter = LiberoAdapter(src_paths, output_path)
+    if output_path.exists():
+        shutil.rmtree(output_path)
 
-    run_converter(
-        adapter=adapter,
-        executor=executor,
-        cpus_per_task=cpus_per_task,
-        tasks_per_job=tasks_per_job,
-        workers=workers,
-        resume_dir=resume_dir,
-        debug=debug,
-        local_repo_id=repo_id,
-        hub_repo_id=repo_id,
-        push_to_hub=push_to_hub,
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        root=output_path,
+        fps=20,
+        robot_type="franka",
+        features=FEATURES,
     )
+
+    for h5_path in _iter_h5_files(src_paths):
+        task = _task_instruction(h5_path.name)
+        if task is None:
+            print(f"[skip] could not parse task from {h5_path.name}")
+            continue
+
+        print(f"Processing {h5_path.name}  →  task: {task!r}")
+        with h5py.File(h5_path, "r") as f:
+            for demo in tqdm(f["data"].values(), desc=h5_path.stem, leave=False):
+                demo_len = len(demo["obs/agentview_rgb"])
+
+                # (-1: open, 1: close) → (0: close, 1: open)
+                action = np.array(demo["actions"], dtype=np.float32)
+                action = np.concatenate(
+                    [action[:, :6], (1 - np.clip(action[:, -1:], 0, 1))],
+                    axis=1,
+                )
+
+                state = np.concatenate(
+                    [np.array(demo["obs/ee_states"]), np.array(demo["obs/gripper_states"])],
+                    axis=1,
+                ).astype(np.float32)
+
+                agentview_rgb     = np.array(demo["obs/agentview_rgb"])
+                eye_in_hand_rgb   = np.array(demo["obs/eye_in_hand_rgb"])
+                agentview_depth   = _expand(np.array(demo["obs/agentview_depth"]))
+                eye_in_hand_depth = _expand(np.array(demo["obs/eye_in_hand_depth"]))
+                agentview_seg     = _expand(np.array(demo["obs/agentview_seg"]))
+                eye_in_hand_seg   = _expand(np.array(demo["obs/eye_in_hand_seg"]))
+                ee_pos            = np.array(demo["obs/ee_pos"],       dtype=np.float32)
+                ee_ori            = np.array(demo["obs/ee_ori"],       dtype=np.float32)
+                ee_state          = np.array(demo["obs/ee_states"],    dtype=np.float32)
+                joint_state       = np.array(demo["obs/joint_states"], dtype=np.float32)
+                gripper_state     = np.array(demo["obs/gripper_states"], dtype=np.float32)
+                robot_state       = np.array(demo["robot_states"],     dtype=np.float32)
+                rewards           = np.array(demo["rewards"],          dtype=np.float32)[:, None]
+                dones             = np.array(demo["dones"],            dtype=bool)[:, None]
+
+                for i in range(demo_len):
+                    dataset.add_frame(
+                        {
+                            "observation.images.agentview_rgb":   agentview_rgb[i],
+                            "observation.images.eye_in_hand_rgb": eye_in_hand_rgb[i],
+                            "observation.images.agentview_depth":   agentview_depth[i],
+                            "observation.images.eye_in_hand_depth": eye_in_hand_depth[i],
+                            "observation.images.agentview_seg":     agentview_seg[i],
+                            "observation.images.eye_in_hand_seg":   eye_in_hand_seg[i],
+                            "observation.state":                  state[i],
+                            "observation.states.ee_pos":          ee_pos[i],
+                            "observation.states.ee_ori":          ee_ori[i],
+                            "observation.states.ee_state":        ee_state[i],
+                            "observation.states.joint_state":     joint_state[i],
+                            "observation.states.gripper_state":   gripper_state[i],
+                            "observation.states.robot_state":     robot_state[i],
+                            "action":                             action[i],
+                            "next.reward":                        rewards[i],
+                            "next.done":                          dones[i],
+                        },
+                        task,
+                    )
+                dataset.save_episode()
+
+    if push_to_hub:
+        dataset.push_to_hub(
+            tags=["libero-mem", "franka"],
+            private=False,
+            push_videos=True,
+            license="apache-2.0",
+        )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src-paths", type=Path, nargs="+", required=True)
-    parser.add_argument("--output-path", type=Path, required=True)
-    parser.add_argument("--executor", type=str, choices=["local", "ray"], default="local")
-    parser.add_argument("--cpus-per-task", type=int, default=1)
-    parser.add_argument(
-        "--tasks-per-job", type=int, default=1, help="number of concurrent tasks per job, only used for ray"
-    )
-    parser.add_argument("--workers", type=int, default=-1, help="number of concurrent jobs to run")
-    parser.add_argument("--resume-dir", type=Path, help="logs directory to resume")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--repo-id", type=str, help="required when push-to-hub is True")
-    parser.add_argument("--push-to-hub", action="store_true", help="upload to hub")
+    parser.add_argument("--src-paths", type=Path, nargs="+", required=True,
+                        help="One or more .hdf5 files or directories containing .hdf5 files")
+    parser.add_argument("--output-path", type=Path, required=True,
+                        help="Root directory for the output LeRobotDataset")
+    parser.add_argument("--repo-id", type=str, required=True,
+                        help="HuggingFace repo id, e.g. your_name/libero_mem")
+    parser.add_argument("--push-to-hub", action="store_true")
     args = parser.parse_args()
 
-    main(**vars(args))
+    main(
+        src_paths=args.src_paths,
+        output_path=args.output_path,
+        repo_id=args.repo_id,
+        push_to_hub=args.push_to_hub,
+    )
