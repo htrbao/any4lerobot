@@ -125,6 +125,22 @@ def main(
     repo_id: str,
     push_to_hub: bool = False,
 ):
+    output_path = output_path.resolve()
+    script_dir = Path(__file__).resolve().parent
+
+    # Guard: refuse to delete the script directory or any of its parents
+    try:
+        output_path.relative_to(script_dir)
+        in_script_dir = True
+    except ValueError:
+        in_script_dir = False
+
+    if in_script_dir or output_path == script_dir:
+        raise ValueError(
+            f"--output-path {output_path} is inside or equal to the script directory "
+            f"{script_dir}. Choose a path outside the repo."
+        )
+
     if output_path.exists():
         shutil.rmtree(output_path)
 
