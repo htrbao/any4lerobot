@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import shutil
@@ -7,9 +8,12 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-from lerobot.datasets.aggregate import aggregate_datasets
+import pyarrow as pa
+import pyarrow.parquet as pq
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
+
+EPISODES_PER_CHUNK = 1000  # must match LeRobot default
 
 FEATURES = {
     # ── RGB images ──────────────────────────────────────────────────────────────
@@ -120,6 +124,133 @@ def _iter_h5_files(src_paths: list[Path]):
 def _expand(arr: np.ndarray) -> np.ndarray:
     """(H, W) → (H, W, 3): tile single-channel for the video encoder."""
     return np.repeat(arr[..., None], 3, axis=-1)
+
+
+# ── Custom aggregation (avoids lerobot version-specific aggregate_datasets) ──────
+
+def _merge_temp_datasets(temp_dirs: list[Path], output_dir: Path, repo_id: str) -> None:
+    """Merge independently written temp LeRobot datasets into one output dataset.
+
+    Handles tasks deduplication, global episode/frame re-indexing, parquet
+    column patching, and video file copying without relying on lerobot internals.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir = output_dir / "meta"
+    meta_dir.mkdir(exist_ok=True)
+
+    # Use first temp dataset's info.json as the base
+    with open(temp_dirs[0] / "meta" / "info.json") as f:
+        info = json.load(f)
+
+    # Collect video feature keys (for file copying)
+    video_keys = [k for k, v in info.get("features", {}).items() if v.get("dtype") == "video"]
+
+    global_task_index: dict[str, int] = {}   # task_str → global idx
+    next_task_idx = 0
+    global_episodes: list[dict] = []
+    global_ep_idx = 0
+    global_frame_idx = 0
+
+    for temp_dir in sorted(temp_dirs):
+        # ── Map local task indices → global ──────────────────────────────────
+        local_task_map: dict[int, int] = {}
+        tasks_file = temp_dir / "meta" / "tasks.jsonl"
+        if tasks_file.exists():
+            for line in tasks_file.read_text().splitlines():
+                if not line.strip():
+                    continue
+                t = json.loads(line)
+                task_str = t["task"]
+                local_idx = t["task_index"]
+                if task_str not in global_task_index:
+                    global_task_index[task_str] = next_task_idx
+                    next_task_idx += 1
+                local_task_map[local_idx] = global_task_index[task_str]
+
+        # ── Process each episode in this temp dataset ─────────────────────────
+        episodes_file = temp_dir / "meta" / "episodes.jsonl"
+        if not episodes_file.exists():
+            continue
+        local_eps = [
+            json.loads(l) for l in episodes_file.read_text().splitlines() if l.strip()
+        ]
+
+        for ep in local_eps:
+            local_ep_idx: int = ep["episode_index"]
+            ep_len: int = ep.get("length", 0)
+
+            # Build updated episode record
+            ep_record = dict(ep)
+            ep_record["episode_index"] = global_ep_idx
+            if "tasks" in ep_record:
+                ep_record["tasks"] = [local_task_map.get(t, t) for t in ep_record["tasks"]]
+
+            # ── Copy & patch parquet ──────────────────────────────────────────
+            src_chunk = local_ep_idx // EPISODES_PER_CHUNK
+            dst_chunk = global_ep_idx // EPISODES_PER_CHUNK
+            src_parquet = (
+                temp_dir / "data" / f"chunk-{src_chunk:03d}"
+                / f"episode_{local_ep_idx:06d}.parquet"
+            )
+            dst_parquet_dir = output_dir / "data" / f"chunk-{dst_chunk:03d}"
+            dst_parquet_dir.mkdir(parents=True, exist_ok=True)
+            dst_parquet = dst_parquet_dir / f"episode_{global_ep_idx:06d}.parquet"
+
+            if src_parquet.exists():
+                table = pq.read_table(src_parquet)
+                n = len(table)
+
+                def _replace_col(tbl, col_name, values, dtype):
+                    if col_name in tbl.schema.names:
+                        idx = tbl.schema.get_field_index(col_name)
+                        tbl = tbl.set_column(idx, col_name, pa.array(values, type=dtype))
+                    return tbl
+
+                table = _replace_col(table, "episode_index",
+                                     [global_ep_idx] * n, pa.int64())
+                table = _replace_col(table, "index",
+                                     list(range(global_frame_idx, global_frame_idx + n)),
+                                     pa.int64())
+                if local_task_map:
+                    if "task_index" in table.schema.names:
+                        old = table.column("task_index").to_pylist()
+                        table = _replace_col(table, "task_index",
+                                             [local_task_map.get(t, t) for t in old],
+                                             pa.int64())
+                pq.write_table(table, dst_parquet)
+
+            # ── Copy video files ──────────────────────────────────────────────
+            for key in video_keys:
+                src_vid_dir = (
+                    temp_dir / "videos" / f"chunk-{src_chunk:03d}" / key
+                )
+                dst_vid_dir = output_dir / "videos" / f"chunk-{dst_chunk:03d}" / key
+                dst_vid_dir.mkdir(parents=True, exist_ok=True)
+                src_vid = src_vid_dir / f"episode_{local_ep_idx:06d}.mp4"
+                if src_vid.exists():
+                    shutil.copy2(src_vid, dst_vid_dir / f"episode_{global_ep_idx:06d}.mp4")
+
+            global_episodes.append(ep_record)
+            global_frame_idx += ep_len
+            global_ep_idx += 1
+
+    # ── Write combined metadata ───────────────────────────────────────────────────
+    with open(meta_dir / "tasks.jsonl", "w") as f:
+        for task_str, task_idx in sorted(global_task_index.items(), key=lambda x: x[1]):
+            f.write(json.dumps({"task_index": task_idx, "task": task_str}) + "\n")
+
+    with open(meta_dir / "episodes.jsonl", "w") as f:
+        for ep in global_episodes:
+            f.write(json.dumps(ep) + "\n")
+
+    info["repo_id"] = repo_id
+    info["total_episodes"] = global_ep_idx
+    info["total_frames"] = global_frame_idx
+    info["total_tasks"] = len(global_task_index)
+    with open(meta_dir / "info.json", "w") as f:
+        json.dump(info, f, indent=2)
+
+    print(f"Merged {global_ep_idx} episodes · {global_frame_idx} frames · {len(global_task_index)} tasks → {output_dir}")
 
 
 # ── Per-file worker (runs in a subprocess) ──────────────────────────────────────
@@ -257,12 +388,7 @@ def main(
     print(f"Aggregating {len(temp_outputs)} temp datasets → {output_path}")
     if output_path.exists():
         shutil.rmtree(output_path)
-    aggregate_datasets(
-        repo_ids=[None] * len(temp_outputs),
-        roots=temp_outputs,
-        aggr_repo_id=repo_id,
-        aggr_root=output_path,
-    )
+    _merge_temp_datasets(temp_outputs, output_path, repo_id)
 
     shutil.rmtree(temp_dir)
     print(f"Done. Dataset written to {output_path}")
