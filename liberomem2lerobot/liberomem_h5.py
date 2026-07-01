@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import lru_cache
 from pathlib import Path
 
 import h5py
@@ -15,7 +16,7 @@ from tqdm import tqdm
 
 EPISODES_PER_CHUNK = 1000  # must match LeRobot default
 
-FEATURES = {
+_BASE_FEATURES = {
     # ── RGB images ──────────────────────────────────────────────────────────────
     "observation.images.agentview_rgb": {
         "dtype": "video",
@@ -104,6 +105,32 @@ FEATURES = {
     },
 }
 
+
+def _build_features(max_landmarks: int) -> dict:
+    """`_BASE_FEATURES` plus fixed-size exo/ego bbox-center landmark vectors.
+
+    Each metadata.json frame may track a different number of objects, so
+    landmarks are padded to `max_landmarks` slots (NaN where no object
+    occupies that slot) to keep a single shape across the whole dataset.
+    """
+    landmark_names = {
+        "motors": [f"x{i}" if axis == 0 else f"y{i}" for i in range(max_landmarks) for axis in (0, 1)]
+    }
+    return {
+        **_BASE_FEATURES,
+        "observation.states.exo-landmarks": {
+            "dtype": "float32",
+            "shape": (max_landmarks * 2,),
+            "names": landmark_names,
+        },
+        "observation.states.ego-landmarks": {
+            "dtype": "float32",
+            "shape": (max_landmarks * 2,),
+            "names": landmark_names,
+        },
+    }
+
+
 _PATTERN1 = re.compile(r"_SCENE\d_\d+_(.*?)_demo\.hdf5")
 _PATTERN2 = re.compile(r"(.*?)_demo\.hdf5")
 
@@ -119,6 +146,68 @@ def _iter_h5_files(src_paths: list[Path]):
             yield src
         elif src.is_dir():
             yield from sorted(src.glob("*.hdf5"))
+
+
+# ── metadata.json (exo/ego bbox landmarks + task description) ───────────────────
+
+@lru_cache(maxsize=None)
+def _load_metadata_json(dir_path: Path) -> dict | None:
+    meta_path = dir_path / "metadata.json"
+    if not meta_path.exists():
+        return None
+    with open(meta_path) as f:
+        return json.load(f)
+
+
+def _metadata_task_key(h5_stem: str, metadata: dict) -> str | None:
+    """metadata.json top-level keys drop the trailing '_demo' that h5 stems have."""
+    if h5_stem in metadata:
+        return h5_stem
+    stripped = re.sub(r"_demo$", "", h5_stem)
+    if stripped in metadata:
+        return stripped
+    return None
+
+
+def _frame_landmarks(frame_boxes: dict, max_landmarks: int) -> np.ndarray:
+    """Flatten a frame's {object: [seg_id, [cx, cy, w, h], subgoal]} dict into
+    a fixed-size (max_landmarks * 2,) vector of bbox centers, NaN-padded."""
+    out = np.full(max_landmarks * 2, np.nan, dtype=np.float32)
+    boxes = list(frame_boxes.values())
+    if len(boxes) > max_landmarks:
+        print(f"[warn] frame has {len(boxes)} tracked objects > max_landmarks={max_landmarks}, truncating")
+        boxes = boxes[:max_landmarks]
+    for slot, (_seg_id, bbox, _subgoal) in enumerate(boxes):
+        out[slot * 2] = bbox[0]      # cx
+        out[slot * 2 + 1] = bbox[1]  # cy
+    return out
+
+
+def _demo_landmarks(boxes_list: list, demo_len: int, max_landmarks: int) -> np.ndarray:
+    return np.stack([
+        _frame_landmarks(boxes_list[i] if i < len(boxes_list) else {}, max_landmarks)
+        for i in range(demo_len)
+    ])
+
+
+def _compute_max_landmarks(h5_files: list[Path]) -> int:
+    """Scan every metadata.json referenced by h5_files for the largest
+    per-frame object count, used to size the landmark features globally."""
+    max_objects = 0
+    seen_dirs: set[Path] = set()
+    for h5_path in h5_files:
+        if h5_path.parent in seen_dirs:
+            continue
+        seen_dirs.add(h5_path.parent)
+        metadata = _load_metadata_json(h5_path.parent)
+        if not metadata:
+            continue
+        for task_entry in metadata.values():
+            for demo_entry in task_entry.values():
+                for boxes_key in ("exo_boxes", "ego_boxes"):
+                    for frame_boxes in demo_entry.get(boxes_key, []):
+                        max_objects = max(max_objects, len(frame_boxes))
+    return max(max_objects, 1)
 
 
 def _expand(arr: np.ndarray) -> np.ndarray:
@@ -255,8 +344,16 @@ def _merge_temp_datasets(temp_dirs: list[Path], output_dir: Path, repo_id: str) 
 
 # ── Per-file worker (runs in a subprocess) ──────────────────────────────────────
 
-def _process_file(h5_path: Path, temp_dir: Path) -> Path | None:
-    task = _task_instruction(h5_path.name)
+def _process_file(h5_path: Path, temp_dir: Path, max_landmarks: int) -> Path | None:
+    metadata = _load_metadata_json(h5_path.parent)
+    task_key = _metadata_task_key(h5_path.stem, metadata) if metadata else None
+    task_meta_root = metadata.get(task_key, {}) if task_key else {}
+
+    task = None
+    if task_meta_root:
+        task = next(iter(task_meta_root.values()), {}).get("task_description")
+    if task is None:
+        task = _task_instruction(h5_path.name)
     if task is None:
         print(f"[skip] could not parse task from {h5_path.name}")
         return None
@@ -270,12 +367,18 @@ def _process_file(h5_path: Path, temp_dir: Path) -> Path | None:
         root=temp_output,
         fps=20,
         robot_type="franka",
-        features=FEATURES,
+        features=_build_features(max_landmarks),
     )
 
     with h5py.File(h5_path, "r") as f:
-        for demo in f["data"].values():
+        for demo_name, demo in f["data"].items():
             demo_len = len(demo["obs/agentview_rgb"])
+
+            demo_meta = task_meta_root.get(demo_name, {})
+            if task_meta_root and not demo_meta:
+                print(f"[warn] no metadata for demo '{demo_name}' in {h5_path.name}; exo/ego landmarks will be NaN")
+            exo_landmarks = _demo_landmarks(demo_meta.get("exo_boxes", []), demo_len, max_landmarks)
+            ego_landmarks = _demo_landmarks(demo_meta.get("ego_boxes", []), demo_len, max_landmarks)
 
             action = np.array(demo["actions"], dtype=np.float32)
             action = np.concatenate(
@@ -318,6 +421,8 @@ def _process_file(h5_path: Path, temp_dir: Path) -> Path | None:
                         "observation.states.joint_state":       joint_state[i],
                         "observation.states.gripper_state":     gripper_state[i],
                         "observation.states.robot_state":       robot_state[i],
+                        "observation.states.exo-landmarks":     exo_landmarks[i],
+                        "observation.states.ego-landmarks":     ego_landmarks[i],
                         "action":                               action[i],
                         "next.reward":                          rewards[i],
                         "next.done":                            dones[i],
@@ -357,12 +462,12 @@ def main(
     temp_dir = output_path.with_name(output_path.name + "_temp")
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    h5_files = [
-        p for p in _iter_h5_files(src_paths)
-        if _task_instruction(p.name) is not None
-    ]
+    h5_files = list(_iter_h5_files(src_paths))
     if not h5_files:
         raise ValueError("No matching .hdf5 files found in --src-paths.")
+
+    max_landmarks = _compute_max_landmarks(h5_files)
+    print(f"Using max_landmarks={max_landmarks} (from metadata.json exo/ego_boxes)")
 
     n_workers = os.cpu_count() or 1 if workers == -1 else workers
     print(f"Converting {len(h5_files)} files with {n_workers} workers ...")
@@ -370,7 +475,7 @@ def main(
     temp_outputs: list[Path] = []
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         futures = {
-            executor.submit(_process_file, h5, temp_dir): h5
+            executor.submit(_process_file, h5, temp_dir, max_landmarks): h5
             for h5 in h5_files
         }
         for future in tqdm(as_completed(futures), total=len(futures), desc="files"):
