@@ -199,14 +199,30 @@ def _compute_max_landmarks(h5_files: list[Path]) -> int:
         if h5_path.parent in seen_dirs:
             continue
         seen_dirs.add(h5_path.parent)
+
+        meta_path = h5_path.parent / "metadata.json"
         metadata = _load_metadata_json(h5_path.parent)
         if not metadata:
+            print(f"[warn] no metadata.json found at {meta_path}")
             continue
-        for task_entry in metadata.values():
-            for demo_entry in task_entry.values():
+
+        dir_max = 0
+        for task_key, task_entry in metadata.items():
+            if not isinstance(task_entry, dict):
+                print(f"[warn] {meta_path}: task '{task_key}' is a {type(task_entry).__name__}, "
+                      f"expected a dict of demos — skipping")
+                continue
+            for demo_key, demo_entry in task_entry.items():
+                if not isinstance(demo_entry, dict):
+                    print(f"[warn] {meta_path}: '{task_key}/{demo_key}' is a {type(demo_entry).__name__}, "
+                          f"expected a dict with exo_boxes/ego_boxes — skipping")
+                    continue
                 for boxes_key in ("exo_boxes", "ego_boxes"):
                     for frame_boxes in demo_entry.get(boxes_key, []):
-                        max_objects = max(max_objects, len(frame_boxes))
+                        dir_max = max(dir_max, len(frame_boxes))
+        print(f"[scan] {meta_path}: {len(metadata)} task(s), max tracked objects in a frame = {dir_max}")
+        max_objects = max(max_objects, dir_max)
+
     return max(max_objects, 1)
 
 
