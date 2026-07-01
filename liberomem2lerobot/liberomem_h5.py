@@ -109,7 +109,7 @@ _BASE_FEATURES = {
 def _build_features(max_landmarks: int) -> dict:
     """`_BASE_FEATURES` plus fixed-size exo/ego bbox-center landmark vectors.
 
-    Each metadata.json frame may track a different number of objects, so
+    Each metainfo.json frame may track a different number of objects, so
     landmarks are padded to `max_landmarks` slots (NaN where no object
     occupies that slot) to keep a single shape across the whole dataset.
     """
@@ -148,11 +148,11 @@ def _iter_h5_files(src_paths: list[Path]):
             yield from sorted(src.glob("*.hdf5"))
 
 
-# ── metadata.json (exo/ego bbox landmarks + task description) ───────────────────
+# ── metainfo.json (exo/ego bbox landmarks + task description) ───────────────────
 
 @lru_cache(maxsize=None)
 def _load_metadata_json(dir_path: Path) -> dict | None:
-    meta_path = dir_path / "metadata.json"
+    meta_path = dir_path / "metainfo.json"
     if not meta_path.exists():
         return None
     with open(meta_path) as f:
@@ -160,7 +160,7 @@ def _load_metadata_json(dir_path: Path) -> dict | None:
 
 
 def _metadata_task_key(h5_stem: str, metadata: dict) -> str | None:
-    """metadata.json top-level keys drop the trailing '_demo' that h5 stems have."""
+    """metainfo.json top-level keys drop the trailing '_demo' that h5 stems have."""
     if h5_stem in metadata:
         return h5_stem
     stripped = re.sub(r"_demo$", "", h5_stem)
@@ -191,7 +191,7 @@ def _demo_landmarks(boxes_list: list, demo_len: int, max_landmarks: int) -> np.n
 
 
 def _compute_max_landmarks(h5_files: list[Path]) -> int:
-    """Scan every metadata.json referenced by h5_files for the largest
+    """Scan every metainfo.json referenced by h5_files for the largest
     per-frame object count, used to size the landmark features globally."""
     max_objects = 0
     seen_dirs: set[Path] = set()
@@ -200,10 +200,10 @@ def _compute_max_landmarks(h5_files: list[Path]) -> int:
             continue
         seen_dirs.add(h5_path.parent)
 
-        meta_path = h5_path.parent / "metadata.json"
+        meta_path = h5_path.parent / "metainfo.json"
         metadata = _load_metadata_json(h5_path.parent)
         if not metadata:
-            print(f"[warn] no metadata.json found at {meta_path}")
+            print(f"[warn] no metainfo.json found at {meta_path}")
             continue
 
         dir_max = 0
@@ -491,9 +491,9 @@ def main(
         raise ValueError("No matching .hdf5 files found in --src-paths.")
     print(f"Found {len(h5_files)} .hdf5 files in --src-paths")
 
-    print("Scanning metadata.json files for max tracked-object count ...")
+    print("Scanning metainfo.json files for max tracked-object count ...")
     max_landmarks = _compute_max_landmarks(h5_files)
-    print(f"Using max_landmarks={max_landmarks} (from metadata.json exo/ego_boxes)")
+    print(f"Using max_landmarks={max_landmarks} (from metainfo.json exo/ego_boxes)")
 
     n_workers = os.cpu_count() or 1 if workers == -1 else workers
     print(f"Converting {len(h5_files)} files with {n_workers} workers ...")
