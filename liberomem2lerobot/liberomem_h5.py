@@ -113,21 +113,15 @@ def _build_features(max_landmarks: int) -> dict:
     landmarks are padded to `max_landmarks` slots (NaN where no object
     occupies that slot) to keep a single shape across the whole dataset.
     """
-    landmark_names = {
-        "motors": [f"x{i}" if axis == 0 else f"y{i}" for i in range(max_landmarks) for axis in (0, 1)]
+    landmark_spec = {
+        "dtype": "float32",
+        "shape": (max_landmarks, 2),
+        "names": ["landmark", "xy"],
     }
     return {
         **_BASE_FEATURES,
-        "observation.states.exo-landmarks": {
-            "dtype": "float32",
-            "shape": (max_landmarks * 2,),
-            "names": landmark_names,
-        },
-        "observation.states.ego-landmarks": {
-            "dtype": "float32",
-            "shape": (max_landmarks * 2,),
-            "names": landmark_names,
-        },
+        "observation.landmark.exo": dict(landmark_spec),
+        "observation.landmark.ego": dict(landmark_spec),
     }
 
 
@@ -171,15 +165,14 @@ def _metadata_task_key(h5_stem: str, metadata: dict) -> str | None:
 
 def _frame_landmarks(frame_boxes: dict, max_landmarks: int) -> np.ndarray:
     """Flatten a frame's {object: [seg_id, [cx, cy, w, h], subgoal]} dict into
-    a fixed-size (max_landmarks * 2,) vector of bbox centers, NaN-padded."""
-    out = np.full(max_landmarks * 2, np.nan, dtype=np.float32)
+    a fixed-size (max_landmarks, 2) array of bbox centers, NaN-padded."""
+    out = np.full((max_landmarks, 2), np.nan, dtype=np.float32)
     boxes = list(frame_boxes.values())
     if len(boxes) > max_landmarks:
         print(f"[warn] frame has {len(boxes)} tracked objects > max_landmarks={max_landmarks}, truncating")
         boxes = boxes[:max_landmarks]
     for slot, (_seg_id, bbox, _subgoal) in enumerate(boxes):
-        out[slot * 2] = bbox[0]      # cx
-        out[slot * 2 + 1] = bbox[1]  # cy
+        out[slot] = bbox[0], bbox[1]  # cx, cy
     return out
 
 
@@ -443,8 +436,8 @@ def _process_file(h5_path: Path, temp_dir: Path, max_landmarks: int) -> Path | N
                         "observation.states.joint_state":       joint_state[i],
                         "observation.states.gripper_state":     gripper_state[i],
                         "observation.states.robot_state":       robot_state[i],
-                        "observation.states.exo-landmarks":     exo_landmarks[i],
-                        "observation.states.ego-landmarks":     ego_landmarks[i],
+                        "observation.landmark.exo":              exo_landmarks[i],
+                        "observation.landmark.ego":              ego_landmarks[i],
                         "action":                               action[i],
                         "next.reward":                          rewards[i],
                         "next.done":                            dones[i],
