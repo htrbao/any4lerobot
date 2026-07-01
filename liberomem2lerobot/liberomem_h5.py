@@ -240,7 +240,7 @@ def _merge_temp_datasets(temp_dirs: list[Path], output_dir: Path, repo_id: str) 
     global_ep_idx = 0
     global_frame_idx = 0
 
-    for temp_dir in sorted(temp_dirs):
+    for temp_dir in tqdm(sorted(temp_dirs), desc="merging", unit="file"):
         # ── Map local task indices → global ──────────────────────────────────
         local_task_map: dict[int, int] = {}
         tasks_file = temp_dir / "meta" / "tasks.jsonl"
@@ -371,7 +371,13 @@ def _process_file(h5_path: Path, temp_dir: Path, max_landmarks: int) -> Path | N
     )
 
     with h5py.File(h5_path, "r") as f:
-        for demo_name, demo in f["data"].items():
+        demo_names = list(f["data"].keys())
+        n_demos = len(demo_names)
+        print(f"[start] {h5_path.name}: {n_demos} demos, task='{task}'")
+        total_frames = 0
+
+        for demo_idx, demo_name in enumerate(demo_names, start=1):
+            demo = f["data"][demo_name]
             demo_len = len(demo["obs/agentview_rgb"])
 
             demo_meta = task_meta_root.get(demo_name, {})
@@ -430,8 +436,10 @@ def _process_file(h5_path: Path, temp_dir: Path, max_landmarks: int) -> Path | N
                     task,
                 )
             dataset.save_episode()
+            total_frames += demo_len
+            print(f"[{h5_path.name}] demo {demo_idx}/{n_demos} '{demo_name}' done: {demo_len} frames")
 
-    print(f"[done] {h5_path.name}")
+    print(f"[done] {h5_path.name}: {n_demos} demos, {total_frames} frames")
     return temp_output
 
 
@@ -465,7 +473,9 @@ def main(
     h5_files = list(_iter_h5_files(src_paths))
     if not h5_files:
         raise ValueError("No matching .hdf5 files found in --src-paths.")
+    print(f"Found {len(h5_files)} .hdf5 files in --src-paths")
 
+    print("Scanning metadata.json files for max tracked-object count ...")
     max_landmarks = _compute_max_landmarks(h5_files)
     print(f"Using max_landmarks={max_landmarks} (from metadata.json exo/ego_boxes)")
 
@@ -473,20 +483,27 @@ def main(
     print(f"Converting {len(h5_files)} files with {n_workers} workers ...")
 
     temp_outputs: list[Path] = []
+    n_failed = 0
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         futures = {
             executor.submit(_process_file, h5, temp_dir, max_landmarks): h5
             for h5 in h5_files
         }
-        for future in tqdm(as_completed(futures), total=len(futures), desc="files"):
+        progress = tqdm(as_completed(futures), total=len(futures), desc="files")
+        for future in progress:
             h5 = futures[future]
             try:
                 result = future.result()
                 if result is not None:
                     temp_outputs.append(result)
+                else:
+                    n_failed += 1
             except Exception as exc:
+                n_failed += 1
                 print(f"[error] {h5.name}: {exc}")
+            progress.set_postfix(done=len(temp_outputs), failed=n_failed)
 
+    print(f"Converted {len(temp_outputs)}/{len(h5_files)} files ({n_failed} skipped/failed)")
     if not temp_outputs:
         raise RuntimeError("All workers failed — no output to aggregate.")
 
