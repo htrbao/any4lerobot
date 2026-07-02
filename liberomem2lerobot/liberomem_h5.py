@@ -476,6 +476,7 @@ def main(
     repo_id: str,
     workers: int = -1,
     push_to_hub: bool = False,
+    task: list[str] | None = None,
 ):
     output_path = output_path.resolve()
     script_dir = Path(__file__).resolve().parent
@@ -499,6 +500,13 @@ def main(
     if not h5_files:
         raise ValueError("No matching .hdf5 files found in --src-paths.")
     print(f"Found {len(h5_files)} .hdf5 files in --src-paths")
+
+    if task:
+        matched = [p for p in h5_files if any(t.lower() in p.stem.lower() for t in task)]
+        print(f"--task filter {task}: {len(matched)}/{len(h5_files)} files matched")
+        if not matched:
+            raise ValueError(f"No .hdf5 files matched --task filter {task}")
+        h5_files = matched
 
     print("Scanning metainfo.json files for max tracked-object count ...")
     max_landmarks = _compute_max_landmarks(h5_files)
@@ -560,6 +568,10 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=-1,
                         help="Number of parallel workers (default: number of CPUs)")
     parser.add_argument("--push-to-hub", action="store_true")
+    parser.add_argument("--task", type=str, nargs="+", default=None,
+                        help="Only convert .hdf5 files whose filename contains one of these "
+                             "substrings (case-insensitive), e.g. --task SCENE1_10 SCENE2_3. "
+                             "Useful for quickly smoke-testing a subset instead of the whole folder.")
     args = parser.parse_args()
 
     main(
@@ -567,5 +579,6 @@ if __name__ == "__main__":
         output_path=args.output_path,
         repo_id=args.repo_id,
         workers=args.workers,
+        task=args.task,
         push_to_hub=args.push_to_hub,
     )
