@@ -163,29 +163,43 @@ def _metadata_task_key(h5_stem: str, metadata: dict) -> str | None:
     return None
 
 
-def _frame_landmarks(frame_boxes: dict, max_landmarks: int) -> np.ndarray:
-    """Flatten a frame's {object: [seg_id, [cx, cy, w, h], subgoal]} dict into
-    a fixed-size (max_landmarks, 2) array of bbox centers, NaN-padded."""
-    out = np.full((max_landmarks, 2), np.nan, dtype=np.float32)
-    boxes = list(frame_boxes.values())
-    if len(boxes) > max_landmarks:
-        print(f"[warn] frame has {len(boxes)} tracked objects > max_landmarks={max_landmarks}, truncating")
-        boxes = boxes[:max_landmarks]
-    for slot, (_seg_id, bbox, _subgoal) in enumerate(boxes):
-        out[slot] = bbox[0], bbox[1]  # cx, cy
-    return out
+def _episode_landmark_slots(boxes_list: list, max_landmarks: int) -> dict[str, int]:
+    """Assign each object seen anywhere in the episode a stable slot index, in
+    first-appearance order, so the same slot always refers to the same object
+    across frames — required to carry a position forward through occlusion."""
+    slot_of: dict[str, int] = {}
+    for frame_boxes in boxes_list:
+        for name in frame_boxes:
+            if name not in slot_of:
+                slot_of[name] = len(slot_of)
+    if len(slot_of) > max_landmarks:
+        print(f"[warn] episode tracks {len(slot_of)} distinct objects > max_landmarks={max_landmarks}, "
+              f"dropping objects first seen after slot {max_landmarks}")
+        slot_of = {name: slot for name, slot in slot_of.items() if slot < max_landmarks}
+    return slot_of
 
 
 def _demo_landmarks(boxes_list: list, demo_len: int, max_landmarks: int) -> np.ndarray:
-    return np.stack([
-        _frame_landmarks(boxes_list[i] if i < len(boxes_list) else {}, max_landmarks)
-        for i in range(demo_len)
-    ])
+    """(demo_len, max_landmarks, 2) array of bbox centers. Each object keeps the
+    same slot for the whole episode; while occluded (missing from a frame) its
+    last-seen position is carried forward instead of going to NaN."""
+    slot_of = _episode_landmark_slots(boxes_list, max_landmarks)
+    out = np.full((demo_len, max_landmarks, 2), np.nan, dtype=np.float32)
+    last_seen = np.full((max_landmarks, 2), np.nan, dtype=np.float32)
+    for i in range(demo_len):
+        frame_boxes = boxes_list[i] if i < len(boxes_list) else {}
+        for name, slot in slot_of.items():
+            if name in frame_boxes:
+                _seg_id, bbox, _subgoal = frame_boxes[name]
+                last_seen[slot] = (bbox[0], bbox[1])
+        out[i] = last_seen
+    return out
 
 
 def _compute_max_landmarks(h5_files: list[Path]) -> int:
-    """Scan every metainfo.json referenced by h5_files for the largest
-    per-frame object count, used to size the landmark features globally."""
+    """Scan every metainfo.json referenced by h5_files for the largest number
+    of distinct objects tracked across a single episode, used to size the
+    landmark features globally so every object gets a stable slot per episode."""
     max_objects = 0
     seen_dirs: set[Path] = set()
     for h5_path in h5_files:
@@ -211,9 +225,11 @@ def _compute_max_landmarks(h5_files: list[Path]) -> int:
                           f"expected a dict with exo_boxes/ego_boxes — skipping")
                     continue
                 for boxes_key in ("exo_boxes", "ego_boxes"):
+                    names = set()
                     for frame_boxes in demo_entry.get(boxes_key, []):
-                        dir_max = max(dir_max, len(frame_boxes))
-        print(f"[scan] {meta_path}: {len(metadata)} task(s), max tracked objects in a frame = {dir_max}")
+                        names.update(frame_boxes.keys())
+                    dir_max = max(dir_max, len(names))
+        print(f"[scan] {meta_path}: {len(metadata)} task(s), max distinct objects in an episode = {dir_max}")
         max_objects = max(max_objects, dir_max)
 
     return max(max_objects, 1)
