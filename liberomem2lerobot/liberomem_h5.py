@@ -197,30 +197,41 @@ def _demo_landmarks(boxes_list: list, demo_len: int, max_landmarks: int) -> np.n
 
 
 def _compute_max_landmarks(h5_files: list[Path]) -> tuple[int, list[str]]:
-    """Scan every metainfo.json referenced by h5_files for the largest number
-    of distinct objects tracked across a single episode, used to size the
-    landmark features globally so every object gets a stable slot per episode.
+    """Scan metainfo.json for the largest number of distinct objects tracked
+    across a single episode, used to size the landmark features globally so
+    every object gets a stable slot per episode. Only scans the task entries
+    that actually match one of `h5_files` (e.g. respects a --task filter),
+    not every task a shared metainfo.json happens to contain.
 
     Returns (max_landmarks, names) where `names` are the objects (in
     first-appearance order) from the episode that produced max_landmarks —
     for logging/sanity-checking, not for slot assignment (that's per-episode)."""
     max_objects = 0
     max_names: list[str] = []
-    seen_dirs: set[Path] = set()
-    for h5_path in h5_files:
-        if h5_path.parent in seen_dirs:
-            continue
-        seen_dirs.add(h5_path.parent)
 
-        meta_path = h5_path.parent / "metainfo.json"
-        metadata = _load_metadata_json(h5_path.parent)
+    files_by_dir: dict[Path, list[Path]] = {}
+    for h5_path in h5_files:
+        files_by_dir.setdefault(h5_path.parent, []).append(h5_path)
+
+    for dir_path, dir_h5_files in files_by_dir.items():
+        meta_path = dir_path / "metainfo.json"
+        metadata = _load_metadata_json(dir_path)
         if not metadata:
             print(f"[warn] no metainfo.json found at {meta_path}")
             continue
 
+        task_keys: set[str] = set()
+        for h5_path in dir_h5_files:
+            task_key = _metadata_task_key(h5_path.stem, metadata)
+            if task_key is None:
+                print(f"[warn] {meta_path}: no task entry matches {h5_path.name}")
+            else:
+                task_keys.add(task_key)
+
         dir_max = 0
         dir_max_names: list[str] = []
-        for task_key, task_entry in metadata.items():
+        for task_key in task_keys:
+            task_entry = metadata[task_key]
             if not isinstance(task_entry, dict):
                 print(f"[warn] {meta_path}: task '{task_key}' is a {type(task_entry).__name__}, "
                       f"expected a dict of demos — skipping")
@@ -239,8 +250,8 @@ def _compute_max_landmarks(h5_files: list[Path]) -> tuple[int, list[str]]:
                     if len(names) > dir_max:
                         dir_max = len(names)
                         dir_max_names = names
-        print(f"[scan] {meta_path}: {len(metadata)} task(s), max distinct objects in an episode = {dir_max}, "
-              f"names={dir_max_names}")
+        print(f"[scan] {meta_path}: {len(task_keys)}/{len(metadata)} task(s) matched, "
+              f"max distinct objects in an episode = {dir_max}, names={dir_max_names}")
         if dir_max > max_objects:
             max_objects = dir_max
             max_names = dir_max_names
