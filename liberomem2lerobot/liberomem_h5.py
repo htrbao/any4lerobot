@@ -196,11 +196,16 @@ def _demo_landmarks(boxes_list: list, demo_len: int, max_landmarks: int) -> np.n
     return out
 
 
-def _compute_max_landmarks(h5_files: list[Path]) -> int:
+def _compute_max_landmarks(h5_files: list[Path]) -> tuple[int, list[str]]:
     """Scan every metainfo.json referenced by h5_files for the largest number
     of distinct objects tracked across a single episode, used to size the
-    landmark features globally so every object gets a stable slot per episode."""
+    landmark features globally so every object gets a stable slot per episode.
+
+    Returns (max_landmarks, names) where `names` are the objects (in
+    first-appearance order) from the episode that produced max_landmarks —
+    for logging/sanity-checking, not for slot assignment (that's per-episode)."""
     max_objects = 0
+    max_names: list[str] = []
     seen_dirs: set[Path] = set()
     for h5_path in h5_files:
         if h5_path.parent in seen_dirs:
@@ -214,6 +219,7 @@ def _compute_max_landmarks(h5_files: list[Path]) -> int:
             continue
 
         dir_max = 0
+        dir_max_names: list[str] = []
         for task_key, task_entry in metadata.items():
             if not isinstance(task_entry, dict):
                 print(f"[warn] {meta_path}: task '{task_key}' is a {type(task_entry).__name__}, "
@@ -225,14 +231,21 @@ def _compute_max_landmarks(h5_files: list[Path]) -> int:
                           f"expected a dict with exo_boxes/ego_boxes — skipping")
                     continue
                 for boxes_key in ("exo_boxes", "ego_boxes"):
-                    names = set()
+                    names: list[str] = []
                     for frame_boxes in demo_entry.get(boxes_key, []):
-                        names.update(frame_boxes.keys())
-                    dir_max = max(dir_max, len(names))
-        print(f"[scan] {meta_path}: {len(metadata)} task(s), max distinct objects in an episode = {dir_max}")
-        max_objects = max(max_objects, dir_max)
+                        for name in frame_boxes:
+                            if name not in names:
+                                names.append(name)
+                    if len(names) > dir_max:
+                        dir_max = len(names)
+                        dir_max_names = names
+        print(f"[scan] {meta_path}: {len(metadata)} task(s), max distinct objects in an episode = {dir_max}, "
+              f"names={dir_max_names}")
+        if dir_max > max_objects:
+            max_objects = dir_max
+            max_names = dir_max_names
 
-    return max(max_objects, 1)
+    return max(max_objects, 1), max_names
 
 
 def _expand(arr: np.ndarray) -> np.ndarray:
@@ -509,8 +522,9 @@ def main(
         h5_files = matched
 
     print("Scanning metainfo.json files for max tracked-object count ...")
-    max_landmarks = _compute_max_landmarks(h5_files)
-    print(f"Using max_landmarks={max_landmarks} (from metainfo.json exo/ego_boxes)")
+    max_landmarks, max_landmark_names = _compute_max_landmarks(h5_files)
+    print(f"Using max_landmarks={max_landmarks} (from metainfo.json exo/ego_boxes), "
+          f"names={max_landmark_names}")
 
     n_workers = os.cpu_count() or 1 if workers == -1 else workers
     print(f"Converting {len(h5_files)} files with {n_workers} workers ...")
