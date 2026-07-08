@@ -112,11 +112,19 @@ def _build_features(max_landmarks: int) -> dict:
     Each metainfo.json frame may track a different number of objects, so
     landmarks are padded to `max_landmarks` slots (NaN where no object
     occupies that slot) to keep a single shape across the whole dataset.
+
+    Shape is a flat (max_landmarks * 2,) — NOT (max_landmarks, 2) — because a
+    2D+ non-video float feature forces HuggingFace `datasets`/pandas into an
+    ArrayXD extension dtype whose `_metadata` is a string instead of a tuple,
+    which crashes `pd.concat` with
+    `AttributeError: 'PandasArrayExtensionDtype' object has no attribute 'v'`
+    in downstream tools (e.g. GR00T's LeRobotSingleDataset) that read the
+    parquet via pandas directly instead of through lerobot.
     """
     landmark_spec = {
         "dtype": "float32",
-        "shape": (max_landmarks, 2),
-        "names": ["landmark", "xy"],
+        "shape": (max_landmarks * 2,),
+        "names": {"motors": [f"{axis}{i}" for i in range(max_landmarks) for axis in ("x", "y")]},
     }
     return {
         **_BASE_FEATURES,
@@ -180,18 +188,20 @@ def _episode_landmark_slots(boxes_list: list, max_landmarks: int) -> dict[str, i
 
 
 def _demo_landmarks(boxes_list: list, demo_len: int, max_landmarks: int) -> np.ndarray:
-    """(demo_len, max_landmarks, 2) array of bbox centers. Each object keeps the
-    same slot for the whole episode; while occluded (missing from a frame) its
-    last-seen position is carried forward instead of going to NaN."""
+    """(demo_len, max_landmarks * 2) flat array of [x0, y0, x1, y1, ...] bbox
+    centers (flat, not (max_landmarks, 2) — see `_build_features`). Each object
+    keeps the same slot for the whole episode; while occluded (missing from a
+    frame) its last-seen position is carried forward instead of going to NaN."""
     slot_of = _episode_landmark_slots(boxes_list, max_landmarks)
-    out = np.full((demo_len, max_landmarks, 2), np.nan, dtype=np.float32)
-    last_seen = np.full((max_landmarks, 2), np.nan, dtype=np.float32)
+    out = np.full((demo_len, max_landmarks * 2), np.nan, dtype=np.float32)
+    last_seen = np.full(max_landmarks * 2, np.nan, dtype=np.float32)
     for i in range(demo_len):
         frame_boxes = boxes_list[i] if i < len(boxes_list) else {}
         for name, slot in slot_of.items():
             if name in frame_boxes:
                 _seg_id, bbox, _subgoal = frame_boxes[name]
-                last_seen[slot] = (bbox[0], bbox[1])
+                last_seen[slot * 2] = bbox[0]
+                last_seen[slot * 2 + 1] = bbox[1]
         out[i] = last_seen
     return out
 
@@ -286,6 +296,7 @@ def _merge_temp_datasets(temp_dirs: list[Path], output_dir: Path, repo_id: str) 
     global_task_index: dict[str, int] = {}   # task_str → global idx
     next_task_idx = 0
     global_episodes: list[dict] = []
+    global_episodes_stats: list[dict] = []
     global_ep_idx = 0
     global_frame_idx = 0
 
@@ -313,6 +324,15 @@ def _merge_temp_datasets(temp_dirs: list[Path], output_dir: Path, repo_id: str) 
             json.loads(l) for l in episodes_file.read_text().splitlines() if l.strip()
         ]
 
+        episodes_stats_file = temp_dir / "meta" / "episodes_stats.jsonl"
+        local_stats_by_idx: dict[int, dict] = {}
+        if episodes_stats_file.exists():
+            for line in episodes_stats_file.read_text().splitlines():
+                if not line.strip():
+                    continue
+                s = json.loads(line)
+                local_stats_by_idx[s["episode_index"]] = s["stats"]
+
         for ep in local_eps:
             local_ep_idx: int = ep["episode_index"]
             ep_len: int = ep.get("length", 0)
@@ -322,6 +342,14 @@ def _merge_temp_datasets(temp_dirs: list[Path], output_dir: Path, repo_id: str) 
             ep_record["episode_index"] = global_ep_idx
             if "tasks" in ep_record:
                 ep_record["tasks"] = [local_task_map.get(t, t) for t in ep_record["tasks"]]
+
+            if local_ep_idx in local_stats_by_idx:
+                global_episodes_stats.append({
+                    "episode_index": global_ep_idx,
+                    "stats": local_stats_by_idx[local_ep_idx],
+                })
+            else:
+                print(f"[warn] no episodes_stats.jsonl entry for {temp_dir.name} episode {local_ep_idx}")
 
             # ── Copy & patch parquet ──────────────────────────────────────────
             src_chunk = local_ep_idx // EPISODES_PER_CHUNK
@@ -380,6 +408,10 @@ def _merge_temp_datasets(temp_dirs: list[Path], output_dir: Path, repo_id: str) 
     with open(meta_dir / "episodes.jsonl", "w") as f:
         for ep in global_episodes:
             f.write(json.dumps(ep) + "\n")
+
+    with open(meta_dir / "episodes_stats.jsonl", "w") as f:
+        for ep_stats in global_episodes_stats:
+            f.write(json.dumps(ep_stats) + "\n")
 
     info["repo_id"] = repo_id
     info["total_episodes"] = global_ep_idx
