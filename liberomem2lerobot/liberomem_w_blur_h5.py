@@ -195,18 +195,29 @@ def _episode_landmark_slots(boxes_list: list, max_landmarks: int) -> dict[str, i
 
 
 def _demo_landmarks(
-    boxes_list: list, demo_len: int, max_landmarks: int
+    boxes_list: list, seg_video: np.ndarray | None, demo_len: int, max_landmarks: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(demo_len, max_landmarks * 2) flat array of [x0, y0, x1, y1, ...] bbox
     centers (flat, not (max_landmarks, 2) — see `_build_features`). Each object
-    keeps the same slot for the whole episode; while occluded (missing from a
-    frame) its last-seen position is carried forward instead of going to NaN.
+    keeps the same slot for the whole episode; while occluded, its last-seen
+    position is carried forward instead of going to NaN.
 
     Also returns per-slot occlusion/source-frame arrays used to render the
-    amodal "trace" video (see `_build_trace_video`): `is_occluded[i, slot]` is
-    True once a slot has been seen at least once but is missing from frame i,
-    and `source_frame[i, slot]` is the most recent frame its position was
-    sampled from (-1 if the slot hasn't appeared yet).
+    amodal "trace" video (see `_build_trace_video`).  `exo_boxes`/`ego_boxes`
+    report each object's ground-truth simulator position every frame, so a
+    missing dict entry alone is a poor occlusion signal — the object is often
+    still listed while visually hidden behind the gripper or another object.
+    Real (visual) occlusion instead comes from *seg_video*, the frame's
+    per-pixel segmentation map: a slot is occluded once seen if its `seg_id`
+    (unpacked from each box entry) doesn't appear anywhere in that frame's
+    segmentation, mirroring how co-tracker's demo_amodal.py treats a landmark
+    as a ghost from the *tracker's predicted visibility*, not from track
+    presence alone.
+
+    `is_occluded[i, slot]` is True once a slot has been seen at least once but
+    is either missing from frame i's boxes or visually hidden per `seg_video`.
+    `source_frame[i, slot]` is the most recent frame its position was sampled
+    from (-1 if the slot hasn't appeared yet).
 
     Returns
     -------
@@ -221,21 +232,26 @@ def _demo_landmarks(
 
     last_seen = np.full(max_landmarks * 2, np.nan, dtype=np.float32)
     last_t = np.full(max_landmarks, -1, dtype=np.int64)
+    slot_seg_id: dict[int, int] = {}
     for i in range(demo_len):
         frame_boxes = boxes_list[i] if i < len(boxes_list) else {}
         visible_now = set()
         for name, slot in slot_of.items():
             if name in frame_boxes:
-                _seg_id, bbox, _subgoal = frame_boxes[name]
+                seg_id, bbox, _subgoal = frame_boxes[name]
+                slot_seg_id[slot] = seg_id
                 last_seen[slot * 2] = bbox[0]
                 last_seen[slot * 2 + 1] = bbox[1]
                 last_t[slot] = i
                 visible_now.add(slot)
         out[i] = last_seen
+        seg_frame = seg_video[i] if seg_video is not None else None
         for slot in slot_of.values():
-            if last_t[slot] >= 0:
-                source_frame[i, slot] = last_t[slot]
-                is_occluded[i, slot] = slot not in visible_now
+            if last_t[slot] < 0:
+                continue
+            source_frame[i, slot] = last_t[slot]
+            visually_hidden = seg_frame is not None and not np.any(seg_frame == slot_seg_id[slot])
+            is_occluded[i, slot] = (slot not in visible_now) or visually_hidden
     return out, is_occluded, source_frame
 
 
@@ -556,10 +572,19 @@ def _process_file(h5_path: Path, temp_dir: Path, max_landmarks: int) -> Path | N
             demo_meta = task_meta_root.get(demo_name, {})
             if task_meta_root and not demo_meta:
                 print(f"[warn] no metadata for demo '{demo_name}' in {h5_path.name}; exo/ego landmarks will be NaN")
+
+            agentview_seg_raw   = np.array(demo["obs/agentview_seg"])
+            eye_in_hand_seg_raw = np.array(demo["obs/eye_in_hand_seg"])
+
             exo_landmarks, exo_is_occluded, exo_source_frame = _demo_landmarks(
-                demo_meta.get("exo_boxes", []), demo_len, max_landmarks
+                demo_meta.get("exo_boxes", []), agentview_seg_raw, demo_len, max_landmarks
             )
-            ego_landmarks, _, _ = _demo_landmarks(demo_meta.get("ego_boxes", []), demo_len, max_landmarks)
+            ego_landmarks, _, _ = _demo_landmarks(
+                demo_meta.get("ego_boxes", []), eye_in_hand_seg_raw, demo_len, max_landmarks
+            )
+            n_occluded_frames = int(exo_is_occluded.any(axis=1).sum())
+            print(f"[{h5_path.name}] demo '{demo_name}': {n_occluded_frames}/{demo_len} frames "
+                  f"with a visually occluded exo landmark ({exo_is_occluded.sum()} landmark-frame slots)")
 
             action = np.array(demo["actions"], dtype=np.float32)
             action = np.concatenate(
@@ -581,8 +606,8 @@ def _process_file(h5_path: Path, temp_dir: Path, max_landmarks: int) -> Path | N
             eye_in_hand_rgb   = np.array(demo["obs/eye_in_hand_rgb"])
             agentview_depth   = _expand(np.array(demo["obs/agentview_depth"]))
             eye_in_hand_depth = _expand(np.array(demo["obs/eye_in_hand_depth"]))
-            agentview_seg     = _expand(np.array(demo["obs/agentview_seg"]))
-            eye_in_hand_seg   = _expand(np.array(demo["obs/eye_in_hand_seg"]))
+            agentview_seg     = _expand(agentview_seg_raw)
+            eye_in_hand_seg   = _expand(eye_in_hand_seg_raw)
             ee_pos            = np.array(demo["obs/ee_pos"],         dtype=np.float32)
             ee_ori            = np.array(demo["obs/ee_ori"],         dtype=np.float32)
             ee_state          = np.array(demo["obs/ee_states"],      dtype=np.float32)
