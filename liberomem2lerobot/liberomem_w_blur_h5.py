@@ -15,6 +15,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
 EPISODES_PER_CHUNK = 1000  # must match LeRobot default
+IMG_H, IMG_W = 256, 256  # must match observation.images.* shapes below
 
 _BASE_FEATURES = {
     # ── RGB images ──────────────────────────────────────────────────────────────
@@ -197,10 +198,12 @@ def _episode_landmark_slots(boxes_list: list, max_landmarks: int) -> dict[str, i
 def _demo_landmarks(
     boxes_list: list, seg_video: np.ndarray | None, demo_len: int, max_landmarks: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(demo_len, max_landmarks * 2) flat array of [x0, y0, x1, y1, ...] bbox
-    centers (flat, not (max_landmarks, 2) — see `_build_features`). Each object
-    keeps the same slot for the whole episode; while occluded, its last-seen
-    position is carried forward instead of going to NaN.
+    """(demo_len, max_landmarks * 2) flat array of [x0, y0, x1, y1, ...] pixel-space
+    bbox centers (flat, not (max_landmarks, 2) — see `_build_features`). metainfo.json
+    stores each box as normalized [x_center, y_center, width, height] fractions of the
+    frame (0-1); only the center is kept, scaled by (IMG_W, IMG_H) into pixel space to
+    match observation.images.*. Each object keeps the same slot for the whole episode;
+    while occluded, its last-seen position is carried forward instead of going to NaN.
 
     Also returns per-slot occlusion/source-frame arrays used to render the
     amodal "trace" video (see `_build_trace_video`).  `exo_boxes`/`ego_boxes`
@@ -240,8 +243,8 @@ def _demo_landmarks(
             if name in frame_boxes:
                 seg_id, bbox, _subgoal = frame_boxes[name]
                 slot_seg_id[slot] = seg_id
-                last_seen[slot * 2] = bbox[0]
-                last_seen[slot * 2 + 1] = bbox[1]
+                last_seen[slot * 2] = bbox[0] * IMG_W
+                last_seen[slot * 2 + 1] = bbox[1] * IMG_H
                 last_t[slot] = i
                 visible_now.add(slot)
         out[i] = last_seen
