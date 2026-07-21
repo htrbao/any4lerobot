@@ -115,24 +115,24 @@ _BASE_FEATURES = {
 
 
 def _build_features(max_landmarks: int) -> dict:
-    """`_BASE_FEATURES` plus fixed-size exo/ego bbox-center landmark vectors.
+    """`_BASE_FEATURES` plus fixed-size exo/ego bbox-center + visibility landmark vectors.
 
     Each metainfo.json frame may track a different number of objects, so
-    landmarks are padded to `max_landmarks` slots (NaN where no object
-    occupies that slot) to keep a single shape across the whole dataset.
+    landmarks are padded to `max_landmarks` slots (NaN position / v=0 where no
+    object occupies that slot) to keep a single shape across the whole dataset.
 
-    Shape is a flat (max_landmarks * 2,) — NOT (max_landmarks, 2) — because a
-    2D+ non-video float feature forces HuggingFace `datasets`/pandas into an
-    ArrayXD extension dtype whose `_metadata` is a string instead of a tuple,
-    which crashes `pd.concat` with
+    Shape is a flat (max_landmarks * 3,) of [x0, y0, v0, x1, y1, v1, ...] — NOT
+    (max_landmarks, 3) — because a 2D+ non-video float feature forces HuggingFace
+    `datasets`/pandas into an ArrayXD extension dtype whose `_metadata` is a
+    string instead of a tuple, which crashes `pd.concat` with
     `AttributeError: 'PandasArrayExtensionDtype' object has no attribute 'v'`
     in downstream tools (e.g. GR00T's LeRobotSingleDataset) that read the
     parquet via pandas directly instead of through lerobot.
     """
     landmark_spec = {
         "dtype": "float32",
-        "shape": (max_landmarks * 2,),
-        "names": {"motors": [f"{axis}{i}" for i in range(max_landmarks) for axis in ("x", "y")]},
+        "shape": (max_landmarks * 3,),
+        "names": {"motors": [f"{axis}{i}" for i in range(max_landmarks) for axis in ("x", "y", "v")]},
     }
     return {
         **_BASE_FEATURES,
@@ -198,42 +198,43 @@ def _episode_landmark_slots(boxes_list: list, max_landmarks: int) -> dict[str, i
 def _demo_landmarks(
     boxes_list: list, seg_video: np.ndarray | None, demo_len: int, max_landmarks: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(demo_len, max_landmarks * 2) flat array of [x0, y0, x1, y1, ...] pixel-space
-    bbox centers (flat, not (max_landmarks, 2) — see `_build_features`). metainfo.json
-    stores each box as normalized [x_center, y_center, width, height] fractions of the
-    frame (0-1); only the center is kept, scaled by (IMG_W, IMG_H) into pixel space to
-    match observation.images.*. Each object keeps the same slot for the whole episode;
-    while occluded, its last-seen position is carried forward instead of going to NaN.
+    """(demo_len, max_landmarks * 3) flat array of [x0, y0, v0, x1, y1, v1, ...]
+    (flat, not (max_landmarks, 3) — see `_build_features`). metainfo.json stores
+    each box as normalized [x_center, y_center, width, height] fractions of the
+    frame (0-1); only the center is kept, scaled by (IMG_W, IMG_H) into pixel
+    space to match observation.images.*. `x, y` are forward-filled through
+    occlusion (last-seen position carried forward instead of going to NaN) so
+    the trace video (see `_build_trace_video`) can still sample a last-known
+    location; `v` is NOT forward-filled — it reports true per-frame visibility
+    (1.0 visible, 0.0 occluded or not-yet-seen).
 
-    Also returns per-slot occlusion/source-frame arrays used to render the
-    amodal "trace" video (see `_build_trace_video`).  `exo_boxes`/`ego_boxes`
-    report each object's ground-truth simulator position every frame, so a
-    missing dict entry alone is a poor occlusion signal — the object is often
-    still listed while visually hidden behind the gripper or another object.
-    Real (visual) occlusion instead comes from *seg_video*, the frame's
-    per-pixel segmentation map: a slot is occluded once seen if its `seg_id`
-    (unpacked from each box entry) doesn't appear anywhere in that frame's
-    segmentation, mirroring how co-tracker's demo_amodal.py treats a landmark
-    as a ghost from the *tracker's predicted visibility*, not from track
-    presence alone.
+    `exo_boxes`/`ego_boxes` report each object's ground-truth simulator
+    position every frame, so a missing dict entry alone is a poor visibility
+    signal — the object is often still listed while visually hidden behind the
+    gripper or another object. Real (visual) occlusion instead comes from
+    *seg_video*, the frame's per-pixel segmentation map: a slot counts as
+    visible only if its `seg_id` (unpacked from each box entry) appears
+    somewhere in that frame's segmentation, mirroring how co-tracker's
+    demo_amodal.py treats a landmark as a ghost from the *tracker's predicted
+    visibility*, not from track presence alone.
 
-    `is_occluded[i, slot]` is True once a slot has been seen at least once but
-    is either missing from frame i's boxes or visually hidden per `seg_video`.
-    `source_frame[i, slot]` is the most recent frame its position was sampled
+    `is_occluded[i, slot]` is the inverse of `v` for slots seen at least once
+    (False before the slot has ever appeared, since there's nothing to occlude
+    yet). `source_frame[i, slot]` is the most recent frame `x, y` was sampled
     from (-1 if the slot hasn't appeared yet).
 
     Returns
     -------
-    positions    : (demo_len, max_landmarks * 2) float32
+    positions    : (demo_len, max_landmarks * 3) float32 — [x, y, v] interleaved per slot
     is_occluded  : (demo_len, max_landmarks) bool
     source_frame : (demo_len, max_landmarks) int64
     """
     slot_of = _episode_landmark_slots(boxes_list, max_landmarks)
-    out = np.full((demo_len, max_landmarks * 2), np.nan, dtype=np.float32)
+    out = np.full((demo_len, max_landmarks * 3), np.nan, dtype=np.float32)
     is_occluded = np.zeros((demo_len, max_landmarks), dtype=bool)
     source_frame = np.full((demo_len, max_landmarks), -1, dtype=np.int64)
 
-    last_seen = np.full(max_landmarks * 2, np.nan, dtype=np.float32)
+    last_xy = np.full((max_landmarks, 2), np.nan, dtype=np.float32)
     last_t = np.full(max_landmarks, -1, dtype=np.int64)
     slot_seg_id: dict[int, int] = {}
     for i in range(demo_len):
@@ -243,18 +244,24 @@ def _demo_landmarks(
             if name in frame_boxes:
                 seg_id, bbox, _subgoal = frame_boxes[name]
                 slot_seg_id[slot] = seg_id
-                last_seen[slot * 2] = bbox[0] * IMG_W
-                last_seen[slot * 2 + 1] = bbox[1] * IMG_H
+                last_xy[slot] = (bbox[0] * IMG_W, bbox[1] * IMG_H)
                 last_t[slot] = i
                 visible_now.add(slot)
-        out[i] = last_seen
+
         seg_frame = seg_video[i] if seg_video is not None else None
         for slot in slot_of.values():
+            visually_hidden = (
+                slot in visible_now
+                and seg_frame is not None
+                and not np.any(seg_frame == slot_seg_id[slot])
+            )
+            slot_visible = (slot in visible_now) and not visually_hidden
+            out[i, slot * 3 + 2] = 1.0 if slot_visible else 0.0
             if last_t[slot] < 0:
                 continue
+            out[i, slot * 3 : slot * 3 + 2] = last_xy[slot]
             source_frame[i, slot] = last_t[slot]
-            visually_hidden = seg_frame is not None and not np.any(seg_frame == slot_seg_id[slot])
-            is_occluded[i, slot] = (slot not in visible_now) or visually_hidden
+            is_occluded[i, slot] = not slot_visible
     return out, is_occluded, source_frame
 
 
@@ -602,7 +609,7 @@ def _process_file(h5_path: Path, temp_dir: Path, max_landmarks: int) -> Path | N
             agentview_rgb     = np.array(demo["obs/agentview_rgb"])
             agentview_trace_rgb = _build_trace_video(
                 agentview_rgb,
-                positions=exo_landmarks.reshape(demo_len, max_landmarks, 2),
+                positions=exo_landmarks.reshape(demo_len, max_landmarks, 3)[..., :2],
                 is_occluded=exo_is_occluded,
                 source_frame=exo_source_frame,
             )
